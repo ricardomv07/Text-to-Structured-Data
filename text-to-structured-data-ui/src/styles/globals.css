@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    background-color: #1a1a2e;
+    color: #eaeaea;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    color: #ffffff;
+}
+
+a {
+    color: #00adb5;
+}
+
+a:hover {
+    color: #00bcd4;
+}
+
+button {
+    background-color: #00adb5;
+    color: #ffffff;
+}
+
+button:hover {
+    background-color: #00bcd4;
+}
+
+input, textarea {
+    background-color: #0f3460;
+    color: #ffffff;
+    border: 1px solid #00adb5;
+}
+
+input::placeholder, textarea::placeholder {
+    color: #b0b0b0;
+}
+
+.card {
+    background-color: #162447;
+    border-radius: 0.5rem;
+    padding: 1rem;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.status-indicator {
+    padding: 0.5rem;
+    border-radius: 0.25rem;
+}
+
+.status-success {
+    background-color: #00c853;
+}
+
+.status-error {
+    background-color: #d50000;
+}
+
+.status-warning {
+    background-color: #ffab00;
+}
