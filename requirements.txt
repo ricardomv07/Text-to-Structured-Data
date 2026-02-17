@@ -7,3 +7,4 @@ flask-cors
 openpyxl
 pandas
 lxml
+python-docx
