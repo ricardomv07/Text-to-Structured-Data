@@ -129,6 +129,65 @@ def save_extracted_data(cliente: str, monto: float, fecha: str, tipo_solicitud: 
         return None
 
 
+def save_batch_data(records: list, raw_text: str = None, filename: str = None):
+    """
+    Save multiple extracted records to database in a single transaction
+    
+    Args:
+        records: List of dictionaries with cliente, monto, fecha, tipo_solicitud
+        raw_text: Original text (optional)
+        filename: Source filename (optional)
+    
+    Returns:
+        dict: {"success": True, "saved_count": N, "records": [...]} or error info
+    """
+    if SessionLocal is None:
+        logger.warning("Database not configured, skipping batch save")
+        return {"success": False, "error": "Database not configured"}
+    
+    if not records or not isinstance(records, list):
+        return {"success": False, "error": "No records provided or invalid format"}
+    
+    try:
+        db = SessionLocal()
+        saved_records = []
+        
+        # Save all records in a single transaction
+        for record in records:
+            new_record = ExtractedData(
+                cliente=record.get('cliente', 'No especificado'),
+                monto=record.get('monto', 0),
+                fecha=record.get('fecha'),
+                tipo_solicitud=record.get('tipo_solicitud', 'Documento'),
+                raw_text=raw_text[:1000] if raw_text else None,
+                filename=filename
+            )
+            db.add(new_record)
+            saved_records.append(new_record)
+        
+        # Commit all at once
+        db.commit()
+        
+        # Refresh to get IDs
+        for record in saved_records:
+            db.refresh(record)
+        
+        result = {
+            "success": True,
+            "saved_count": len(saved_records),
+            "records": [record.to_dict() for record in saved_records]
+        }
+        
+        logger.info(f"Saved {len(saved_records)} records to database in batch")
+        
+        db.close()
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error saving batch to database: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+
 def get_all_records(limit: int = 100, offset: int = 0):
     """
     Get all records from database

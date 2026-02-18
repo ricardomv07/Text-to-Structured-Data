@@ -154,19 +154,28 @@ async def process_file(file: UploadFile = File(...)):
                     prompt = f"""
                     Analiza el siguiente texto. Si contiene una lista, tabla o múltiples transacciones, extrae CADA UNA como un objeto independiente. 
                     Si es un documento único, extrae solo ese.
-                    Responde ESTRICTAMENTE con un arreglo de objetos JSON con este formato:                    
-                    {{"cliente": "nombre del cliente o empresa", "monto": 1234, "fecha": "DD/MM/YYYY", "tipo_solicitud": "Factura/Venta/Cotizacion"}}
+                    
+                    Responde ESTRICTAMENTE con un arreglo JSON (array) de objetos con este formato:
+                    [
+                        {{"cliente": "nombre del cliente", "monto": 1234, "fecha": "DD/MM/YYYY", "tipo_solicitud": "Factura/Venta/Cotizacion"}},
+                        {{"cliente": "otro cliente", "monto": 5678, "fecha": "DD/MM/YYYY", "tipo_solicitud": "Factura/Venta/Cotizacion"}}
+                    ]
+                    
+                    IMPORTANTE: 
+                    - Siempre responde con un ARRAY [], aunque sea un solo objeto
+                    - Si es un solo documento/transacción, responde: [{{"cliente": "...", "monto": ..., ...}}]
+                    - Si son múltiples, responde: [{{"cliente": "...", ...}}, {{"cliente": "...", ...}}]
                     
                     Texto:
                     {raw_text[:2000]}
                     
-                    Responde SOLO el JSON, sin explicaciones, sin texto adicional ni bloques de código.
+                    Responde SOLO el JSON array, sin explicaciones, sin texto adicional ni bloques de código.
                     """
                 else:
                     # Retry with even simpler prompt
                     prompt = f"""
-                    Del siguiente texto extrae cliente, monto, fecha y tipo.
-                    Responde en formato JSON sin texto adicional.
+                    Del siguiente texto extrae cliente, monto, fecha y tipo de CADA registro.
+                    Responde con un array JSON: [{{"cliente": "...", "monto": 123, "fecha": "DD/MM/YYYY", "tipo_solicitud": "..."}}]
                     
                     Texto: {raw_text[:1000]}
                     
@@ -205,7 +214,8 @@ async def process_file(file: UploadFile = File(...)):
                             part = part.strip()
                             if part.startswith('json'):
                                 part = part[4:].strip()
-                            if part.startswith('{'):
+                            # Look for arrays or objects
+                            if part.startswith('[') or part.startswith('{'):
                                 try:
                                     json_response = json.loads(part)
                                     logger.info("Successfully extracted JSON from markdown")
@@ -213,24 +223,37 @@ async def process_file(file: UploadFile = File(...)):
                                 except:
                                     continue
                     
-                    # If still no JSON, try to find JSON object in text
+                    # If still no JSON, try to find JSON array or object in text
                     if not json_response:
                         import re
-                        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text)
-                        if json_match:
+                        # First try to find array
+                        array_match = re.search(r'\[[^\[\]]*(?:\{[^{}]*\}[^\[\]]*)*\]', response_text, re.DOTALL)
+                        if array_match:
                             try:
-                                json_response = json.loads(json_match.group())
-                                logger.info("Successfully extracted JSON using regex")
+                                json_response = json.loads(array_match.group())
+                                logger.info("Successfully extracted JSON array using regex")
                             except:
                                 pass
+                        
+                        # If no array found, try single object (backwards compatibility)
+                        if not json_response:
+                            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text)
+                            if json_match:
+                                try:
+                                    json_response = json.loads(json_match.group())
+                                    logger.info("Successfully extracted JSON object using regex")
+                                except:
+                                    pass
                 
                 # Validate the JSON response structure
                 if json_response:
-                    # Validate and normalize (converts null to defaults, maps 'tipo' to 'tipo_solicitud')
-                    validate_json_response(json_response)
+                    # Validate and normalize (returns list of validated records, even if single object)
+                    validated_records = validate_json_response(json_response)
                     
-                    # Additional validation: ensure cliente is not empty
-                    cliente = json_response.get('cliente', '')
+                    # Additional validation: ensure at least one cliente is not empty
+                    # Check first record (if no records are valid, validation would have failed already)
+                    first_record = validated_records[0] if validated_records else {}
+                    cliente = first_record.get('cliente', '')
                     if isinstance(cliente, str):
                         cliente = cliente.strip()
                     else:
@@ -244,11 +267,15 @@ async def process_file(file: UploadFile = File(...)):
                         else:
                             # Last attempt - set default value instead of failing
                             logger.warning(f"Cliente still empty on final attempt, using default")
-                            json_response['cliente'] = "Sin nombre especificado"
-                            json_response['cliente'] = "Sin nombre especificado"
+                            validated_records[0]['cliente'] = "Sin nombre especificado"
+                    
+                    # Store the validated records list
+                    json_response = validated_records
                     
                     logger.info(f"JSON validation successful on attempt {attempt}")
-                    logger.info(f"Extracted - Cliente: {json_response.get('cliente', 'N/A')}, Monto: {json_response.get('monto', 'N/A')}")
+                    logger.info(f"Extracted {len(validated_records)} record(s)")
+                    if validated_records:
+                        logger.info(f"First record - Cliente: {validated_records[0].get('cliente', 'N/A')}, Monto: {validated_records[0].get('monto', 'N/A')}")
                     break
                 else:
                     # Last resort: if still no JSON and it's the final attempt, log the full response
@@ -274,16 +301,26 @@ async def process_file(file: UploadFile = File(...)):
                 detail="No se pudo extraer datos estructurados del documento."
             )
         
-        # Format date if present
-        if 'fecha' in json_response and json_response['fecha']:
-            json_response['fecha'] = format_date(json_response['fecha'])
+        # Format date for all records (json_response is now always a list)
+        if isinstance(json_response, list):
+            for record in json_response:
+                if 'fecha' in record and record['fecha']:
+                    record['fecha'] = format_date(record['fecha'])
         
         # NOTE: Data is NOT saved automatically - user must click "Guardar" to save
-        logger.info("File processed successfully (not saved to database yet)")
+        logger.info(f"File processed successfully - {len(json_response)} record(s) extracted (not saved to database yet)")
+        
+        # Return message based on number of records
+        if len(json_response) == 1:
+            message = "Datos extraídos correctamente. Revisa y presiona 'Guardar' para almacenar en la base de datos."
+        else:
+            message = f"Se extrajeron {len(json_response)} registros. Revisa y presiona 'Guardar' para almacenar todos en la base de datos."
+        
         return {
             "raw_text": raw_text,
             "structured_data": json_response,
-            "message": "Datos extraídos correctamente. Revisa y presiona 'Guardar' para almacenar en la base de datos."
+            "record_count": len(json_response),
+            "message": message
         }
     
     except HTTPException as http_ex:
@@ -304,13 +341,17 @@ async def root():
         "version": "2.0",
         "endpoints": {
             "health": "/api/health [GET] - Check API health and dependencies",
-            "process": "/api/process [POST] - Process document and extract data",
-            "save": "/api/save [POST] - Save edited JSON to database",
+            "process": "/api/process [POST] - Process document and extract data (returns array of records)",
+            "save": "/api/save [POST] - Save single or multiple records to database (supports batch)",
             "history": "/api/history [GET] - Get all saved records",
             "records": "/api/records [GET] - Get all saved records (with pagination)",
             "search_client": "/api/records/search?cliente=name [GET] - Search by client",
             "search_type": "/api/records/search?tipo=type [GET] - Search by type",
             "stats": "/api/stats [GET] - Get database statistics"
+        },
+        "features": {
+            "multiple_records": "Extracts multiple records from tables/lists automatically",
+            "batch_save": "Save multiple records in a single transaction"
         },
         "database_status": "configured" if database.SessionLocal else "not_configured"
     }
@@ -445,8 +486,9 @@ async def get_stats():
 async def save_to_database(request_data: dict):
     """
     Save manually edited JSON data to database
+    Supports both single record and multiple records (batch save)
     
-    Request body:
+    Request body for single record:
     {
         "data": {
             "cliente": "Juan Pérez",
@@ -456,8 +498,16 @@ async def save_to_database(request_data: dict):
         }
     }
     
+    Request body for multiple records:
+    {
+        "data": [
+            {"cliente": "Juan Pérez", "monto": 15000, "fecha": "15/02/2026", "tipo_solicitud": "Factura"},
+            {"cliente": "María López", "monto": 8500, "fecha": "16/02/2026", "tipo_solicitud": "Venta"}
+        ]
+    }
+    
     Returns:
-        Success message with record ID
+        Success message with record ID(s)
     """
     if database.SessionLocal is None:
         raise HTTPException(
@@ -468,41 +518,86 @@ async def save_to_database(request_data: dict):
     try:
         data = request_data.get('data', {})
         
-        # Validate required fields
-        if not data.get('cliente'):
-            raise HTTPException(
-                status_code=400,
-                detail="El campo 'cliente' es requerido"
+        # Check if data is an array (batch save) or single object
+        if isinstance(data, list):
+            # Batch save
+            if len(data) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El array de datos está vacío"
+                )
+            
+            # Validate all records have required fields
+            for i, record in enumerate(data):
+                if not record.get('cliente'):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Registro {i+1}: El campo 'cliente' es requerido"
+                    )
+                if not record.get('tipo_solicitud'):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Registro {i+1}: El campo 'tipo_solicitud' es requerido"
+                    )
+            
+            # Save all records in batch
+            result = database.save_batch_data(
+                records=data,
+                raw_text=None,
+                filename=None
             )
+            
+            if result.get('success'):
+                logger.info(f"Batch save: {result['saved_count']} records saved to database")
+                return {
+                    "success": True,
+                    "message": f"{result['saved_count']} registros guardados exitosamente",
+                    "saved_count": result['saved_count'],
+                    "records": result['records']
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": result.get('error', 'Error desconocido al guardar en batch')
+                }
         
-        if not data.get('tipo_solicitud'):
-            raise HTTPException(
-                status_code=400,
-                detail="El campo 'tipo_solicitud' es requerido"
-            )
-        
-        # Save to database
-        db_record = database.save_extracted_data(
-            cliente=data.get('cliente', 'Unknown'),
-            monto=float(data.get('monto', 0)) if data.get('monto') else 0,
-            fecha=data.get('fecha'),
-            tipo_solicitud=data.get('tipo_solicitud', 'Unknown'),
-            raw_text=None,
-            filename=None
-        )
-        
-        if db_record:
-            logger.info(f"Manually edited data saved to database with ID: {db_record['id']}")
-            return {
-                "success": True,
-                "message": "Registro guardado exitosamente",
-                "id": db_record['id']
-            }
         else:
-            return {
-                "success": False,
-                "error": "Error al guardar en la base de datos"
-            }
+            # Single record save (backwards compatibility)
+            # Validate required fields
+            if not data.get('cliente'):
+                raise HTTPException(
+                    status_code=400,
+                    detail="El campo 'cliente' es requerido"
+                )
+            
+            if not data.get('tipo_solicitud'):
+                raise HTTPException(
+                    status_code=400,
+                    detail="El campo 'tipo_solicitud' es requerido"
+                )
+            
+            # Save to database
+            db_record = database.save_extracted_data(
+                cliente=data.get('cliente', 'Unknown'),
+                monto=float(data.get('monto', 0)) if data.get('monto') else 0,
+                fecha=data.get('fecha'),
+                tipo_solicitud=data.get('tipo_solicitud', 'Unknown'),
+                raw_text=None,
+                filename=None
+            )
+            
+            if db_record:
+                logger.info(f"Manually edited data saved to database with ID: {db_record['id']}")
+                return {
+                    "success": True,
+                    "message": "Registro guardado exitosamente",
+                    "id": db_record['id']
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "Error al guardar en la base de datos"
+                }
             
     except HTTPException:
         raise
