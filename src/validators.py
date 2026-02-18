@@ -59,8 +59,7 @@ def validate_json_response(response):
     
     else:
         raise ValueError("Response must be a JSON object or array of objects.")
-    
-    return True
+
 
 def handle_invalid_json(response):
     try:

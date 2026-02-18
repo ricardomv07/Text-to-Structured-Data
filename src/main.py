@@ -307,8 +307,14 @@ async def process_file(file: UploadFile = File(...)):
                 if 'fecha' in record and record['fecha']:
                     record['fecha'] = format_date(record['fecha'])
         
+        # Ensure json_response is a list (should always be after validation)
+        if not isinstance(json_response, list):
+            logger.warning(f"json_response is not a list! Type: {type(json_response)}, converting...")
+            json_response = [json_response] if json_response else []
+        
         # NOTE: Data is NOT saved automatically - user must click "Guardar" to save
         logger.info(f"File processed successfully - {len(json_response)} record(s) extracted (not saved to database yet)")
+        logger.info(f"Returning structured_data as list with {len(json_response)} items")
         
         # Return message based on number of records
         if len(json_response) == 1:
@@ -517,6 +523,16 @@ async def save_to_database(request_data: dict):
     
     try:
         data = request_data.get('data', {})
+        
+        logger.info(f"Received data type: {type(data)}, is list: {isinstance(data, list)}")
+        
+        # Handle case where frontend sends object with numeric keys instead of array
+        # Example: {"0": {...}, "1": {...}} instead of [{...}, {...}]
+        if isinstance(data, dict) and all(key.isdigit() for key in data.keys()):
+            logger.info(f"Converting indexed object to array (found {len(data)} numeric keys)")
+            # Convert to array: sort by numeric key and extract values
+            data = [data[str(i)] for i in range(len(data))]
+            logger.info(f"Converted to array with {len(data)} records")
         
         # Check if data is an array (batch save) or single object
         if isinstance(data, list):
