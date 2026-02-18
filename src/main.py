@@ -103,42 +103,50 @@ async def process_file(file: UploadFile = File(...)):
         # Count how many keywords appear in the document
         keyword_matches = sum(1 for keyword in business_keywords if keyword in text_lower)
         
-        if keyword_matches < 2:
-            logger.warning(f"Document failed keyword validation (only {keyword_matches} matches)")
+        # Skip keyword validation if document is very short (< 50 chars might be just a title)
+        if len(raw_text) < 50:
+            logger.warning(f"Document too short ({len(raw_text)} characters)")
             raise HTTPException(
                 status_code=400,
-                detail="Este documento no parece contener información comercial relevante (facturas, cotizaciones, solicitudes de compra). Por favor, sube un documento válido."
+                detail="El documento es demasiado corto. Por favor, sube un documento con contenido suficiente."
             )
         
-        logger.info(f"Keyword validation passed ({keyword_matches} matches)")
+        # Only reject if NO keywords found (very likely irrelevant)
+        if keyword_matches == 0:
+            logger.warning(f"Document failed keyword validation (0 matches)")
+            raise HTTPException(
+                status_code=400,
+                detail="Este documento no parece contener información comercial. Por favor, sube una factura, cotización o solicitud de compra."
+            )
+        
+        logger.info(f"Keyword validation passed ({keyword_matches} keyword matches)")
         
         # Step 2: AI-based validation (more thorough)
         logger.info("Validating document relevance with AI...")
         model = genai.GenerativeModel('gemini-2.5-flash')
         
         relevance_prompt = f"""
-        Analiza si este documento es una FACTURA, COTIZACIÓN, SOLICITUD DE COMPRA o documento comercial similar.
+        Analiza si este documento es un MANUAL, POLÍTICA o PROCEDIMIENTO INTERNO.
         
-        Debe contener:
-        - Nombre ESPECÍFICO de un cliente/empresa (no genérico)
-        - Monto o precio ESPECÍFICO con números
-        - Información de transacción comercial
+        Responde "NO" SOLO si el documento es claramente un manual técnico, política organizacional, procedimiento interno o lineamiento institucional.
+        
+        Responde "SI" si el documento podría ser una factura, cotización, solicitud, queja o cualquier documento comercial/transaccional.
         
         Texto:
         {raw_text[:800]}
         
-        Responde ÚNICAMENTE "SI" si es un documento comercial válido con datos específicos de transacción.
-        Responde "NO" si es un manual, política, procedimiento, lineamiento u otro documento no comercial.
+        Responde ÚNICAMENTE "SI" o "NO".
         """
         
         relevance_response = model.generate_content(relevance_prompt)
         relevance_text = relevance_response.text.strip().upper()
         
-        if "NO" in relevance_text or "SI" not in relevance_text:
-            logger.warning(f"AI validation failed: {relevance_text}")
+        # Only reject if AI is confident it's NOT a commercial document
+        if "NO" in relevance_text and "SI" not in relevance_text:
+            logger.warning(f"AI validation rejected document: {relevance_text}")
             raise HTTPException(
                 status_code=400,
-                detail="Este archivo no contiene información de transacciones comerciales. Por favor, sube una factura, cotización o solicitud de compra válida."
+                detail="Este documento parece ser un manual o política interna, no una transacción comercial. Por favor, sube una factura, cotización o solicitud de compra."
             )
         
         # Step 2: Extract structured data with retry mechanism
@@ -223,37 +231,24 @@ async def process_file(file: UploadFile = File(...)):
                 if json_response:
                     validate_json_response(json_response)
                     
-                    # Additional validation: Check for generic/invented data
+                    # Light validation: Only reject CLEARLY fake data
                     cliente = json_response.get('cliente', '').strip()
-                    monto = json_response.get('monto', 0)
                     
-                    # List of generic/placeholder values that indicate no real data
-                    generic_values = [
-                        'unknown', 'no especificado', 'n/a', 'na', 'none', 'null',
-                        'cliente', 'empresa', 'comprador', 'solicitante', 'proveedor',
-                        'no disponible', 'sin información', 'no indicado', 'vacío',
-                        'test', 'ejemplo', 'demo', 'muestra'
-                    ]
+                    # Only reject if client is completely missing or obviously fake
+                    very_generic = ['unknown', 'no especificado', 'n/a', 'none', 'null', 'xxx']
                     
-                    # Check if client name is generic or too short
                     if (not cliente or 
-                        len(cliente) < 3 or 
-                        cliente.lower() in generic_values or
-                        any(generic in cliente.lower() for generic in ['xxx', '???', 'pendiente'])):
-                        logger.warning(f"Generic client name detected: {cliente}")
-                        raise ValueError("No se encontró un nombre de cliente válido en el documento")
+                        len(cliente) < 2 or 
+                        cliente.lower() in very_generic):
+                        logger.warning(f"Suspicious client name: {cliente}")
+                        # Don't reject immediately, let next attempt try
+                        if attempt < max_retries:
+                            raise ValueError(f"Client name too generic on attempt {attempt}, retrying...")
+                        else:
+                            # Last attempt - accept it anyway but log warning
+                            logger.warning("Accepting potentially generic data on final attempt")
                     
-                    # Check if amount is missing or zero
-                    try:
-                        monto_float = float(monto) if monto else 0
-                        if monto_float <= 0:
-                            logger.warning(f"Invalid amount detected: {monto}")
-                            raise ValueError("No se encontró un monto válido en el documento")
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid amount format: {monto}")
-                        raise ValueError("No se encontró un monto válido en el documento")
-                    
-                    logger.info(f"Data validation successful (Cliente: {cliente}, Monto: {monto})")
+                    logger.info(f"Data extracted (Cliente: {cliente}, Monto: {json_response.get('monto', 'N/A')})")
                     logger.info(f"JSON validation successful on attempt {attempt}")
                     break
                 else:
