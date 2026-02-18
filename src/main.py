@@ -152,14 +152,15 @@ async def process_file(file: UploadFile = File(...)):
                 
                 if attempt == 1:
                     prompt = f"""
-                    Extrae esta información del texto y responde SOLO con JSON:
-                    
-                    {{"cliente": "nombre del cliente o empresa", "monto": 1234, "fecha": "DD/MM/YYYY", "tipo_solicitud": "Factura"}}
+                    Analiza el siguiente texto. Si contiene una lista, tabla o múltiples transacciones, extrae CADA UNA como un objeto independiente. 
+                    Si es un documento único, extrae solo ese.
+                    Responde ESTRICTAMENTE con un arreglo de objetos JSON con este formato:                    
+                    {{"cliente": "nombre del cliente o empresa", "monto": 1234, "fecha": "DD/MM/YYYY", "tipo_solicitud": "Factura/Venta/Cotizacion"}}
                     
                     Texto:
                     {raw_text[:2000]}
                     
-                    Responde SOLO el JSON, sin explicaciones.
+                    Responde SOLO el JSON, sin explicaciones, sin texto adicional ni bloques de código.
                     """
                 else:
                     # Retry with even simpler prompt
