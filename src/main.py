@@ -87,7 +87,7 @@ async def process_file(file: UploadFile = File(...)):
         
         logger.info(f"Extracted {len(raw_text)} characters of text")
         
-        # Basic validation: Only reject if document is empty or too short
+        # Basic validation: Check if document is empty
         if len(raw_text.strip()) < 20:
             logger.warning(f"Document too short ({len(raw_text)} characters)")
             raise HTTPException(
@@ -95,7 +95,33 @@ async def process_file(file: UploadFile = File(...)):
                 detail="El documento está vacío o es demasiado corto. Por favor, sube un documento con contenido."
             )
         
-        logger.info("Document validation passed - proceeding to extraction")
+        # Light keyword validation (fast, minimal false positives)
+        logger.info("Validating document content...")
+        text_lower = raw_text.lower()
+        
+        # Check for business-related keywords
+        commercial_keywords = [
+            'factura', 'cotización', 'cotizacion', 'presupuesto', 'pedido',
+            'venta', 'compra', 'solicitud', 'orden', 'contrato', 'servicio',
+            'cliente', 'proveedor', 'empresa', 'comprador', 'vendedor',
+            'monto', 'precio', 'total', 'subtotal', 'iva', '$', 'pesos', 'usd', 'cantidad'
+        ]
+        
+        # Check for obvious non-commercial document types
+        non_commercial_keywords = ['política', 'politica', 'procedimiento', 'lineamiento', 'manual técnico', 'reglamento']
+        
+        has_commercial = any(keyword in text_lower for keyword in commercial_keywords)
+        has_non_commercial = any(keyword in text_lower for keyword in non_commercial_keywords)
+        
+        # Reject only if clearly non-commercial AND no commercial keywords
+        if has_non_commercial and not has_commercial:
+            logger.warning("Document appears to be a policy/manual without commercial content")
+            raise HTTPException(
+                status_code=400,
+                detail="Este documento parece ser un manual o política interna. Por favor, sube una factura, cotización o solicitud de compra."
+            )
+        
+        logger.info(f"Document validation passed (commercial: {has_commercial}, non-commercial: {has_non_commercial})")
         
         # Extract structured data with retry mechanism
         logger.info("Extracting structured data...")
@@ -207,27 +233,12 @@ async def process_file(file: UploadFile = File(...)):
         if 'fecha' in json_response and json_response['fecha']:
             json_response['fecha'] = format_date(json_response['fecha'])
         
-        # Save to database automatically (if configured)
-        # Note: db_id is not exposed in the response, only logged
-        try:
-            db_record = database.save_extracted_data(
-                cliente=json_response.get('cliente', 'Unknown'),
-                monto=float(json_response.get('monto', 0)) if json_response.get('monto') else 0,
-                fecha=json_response.get('fecha'),
-                tipo_solicitud=json_response.get('tipo_solicitud', 'Unknown'),
-                raw_text=raw_text,
-                filename=file.filename
-            )
-            if db_record:
-                logger.info(f"Data saved to database with ID: {db_record['id']}")
-        except Exception as e:
-            logger.warning(f"Could not save to database: {str(e)}")
-            # Don't fail the request if database save fails
-        
-        logger.info("File processed successfully")
+        # NOTE: Data is NOT saved automatically - user must click "Guardar" to save
+        logger.info("File processed successfully (not saved to database yet)")
         return {
             "raw_text": raw_text,
-            "structured_data": json_response
+            "structured_data": json_response,
+            "message": "Datos extraídos correctamente. Revisa y presiona 'Guardar' para almacenar en la base de datos."
         }
     
     except HTTPException:
