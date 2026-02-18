@@ -66,11 +66,17 @@ def format_date(date_str: str) -> str:
 
 @app.post("/api/process")
 async def process_file(file: UploadFile = File(...)):
+    """Process uploaded file and extract structured data"""
     try:
-        logger.info(f"Processing file: {file.filename}")
+        logger.info(f"=== NEW REQUEST: Processing file: {file.filename} ===")
         
         # Read file content
-        file_content = await file.read()
+        try:
+            file_content = await file.read()
+            logger.info(f"File read successfully ({len(file_content)} bytes)")
+        except Exception as read_error:
+            logger.error(f"Error reading file: {read_error}")
+            raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {str(read_error)}")
         
         # Validate file is not empty
         if not file_content:
@@ -185,9 +191,21 @@ async def process_file(file: UploadFile = File(...)):
                     {{"cliente": "nombre específico", "monto": 0, "fecha": "DD/MM/YYYY", "tipo_solicitud": "tipo"}}
                     """
                 
-                response = model.generate_content(prompt)
-                response_text = response.text.strip()
-                logger.info(f"Received response (length: {len(response_text)} chars)")
+                # Call Gemini API with error handling
+                try:
+                    response = model.generate_content(prompt)
+                    response_text = response.text.strip()
+                    logger.info(f"Received response (length: {len(response_text)} chars)")
+                except Exception as gemini_error:
+                    logger.error(f"Gemini API error on attempt {attempt}: {str(gemini_error)}")
+                    # Check if it's a rate limit or quota error
+                    error_msg = str(gemini_error).lower()
+                    if 'quota' in error_msg or 'rate' in error_msg or 'limit' in error_msg:
+                        logger.warning("Rate limit or quota exceeded, waiting longer before retry...")
+                        time.sleep(2 * attempt)  # Exponential backoff
+                        raise ValueError(f"Gemini API rate limit (attempt {attempt})")
+                    else:
+                        raise  # Re-raise if it's not a rate limit issue
                 
                 # Try to parse JSON directly
                 try:
@@ -274,11 +292,15 @@ async def process_file(file: UploadFile = File(...)):
             "message": "Datos extraídos correctamente. Revisa y presiona 'Guardar' para almacenar en la base de datos."
         }
     
-    except HTTPException:
+    except HTTPException as http_ex:
+        logger.error(f"HTTP Exception: {http_ex.detail}")
         raise
     except Exception as e:
-        logger.error(f"Error processing file: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
+        logger.error(f"CRITICAL ERROR processing file: {str(e)}", exc_info=True)
+        # Return more detailed error for debugging
+        error_type = type(e).__name__
+        error_detail = f"Error tipo {error_type}: {str(e)}"
+        raise HTTPException(status_code=500, detail=error_detail)
 
 @app.get("/")
 async def root():
@@ -287,6 +309,7 @@ async def root():
         "message": "API Text-to-Structured-Data running",
         "version": "2.0",
         "endpoints": {
+            "health": "/api/health [GET] - Check API health and dependencies",
             "process": "/api/process [POST] - Process document and extract data",
             "save": "/api/save [POST] - Save edited JSON to database",
             "history": "/api/history [GET] - Get all saved records",
@@ -297,6 +320,45 @@ async def root():
         },
         "database_status": "configured" if database.SessionLocal else "not_configured"
     }
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint to verify all dependencies"""
+    health_status = {
+        "status": "healthy",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "checks": {}
+    }
+    
+    # Check Gemini API
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            genai.configure(api_key=api_key)
+            test_model = genai.GenerativeModel('gemini-2.5-flash')
+            # Quick test
+            test_response = test_model.generate_content("Respond with: OK")
+            health_status["checks"]["gemini_api"] = "operational"
+        else:
+            health_status["checks"]["gemini_api"] = "missing_api_key"
+            health_status["status"] = "degraded"
+    except Exception as e:
+        health_status["checks"]["gemini_api"] = f"error: {str(e)[:100]}"
+        health_status["status"] = "degraded"
+    
+    # Check Database
+    try:
+        if database.SessionLocal:
+            # Try to get count of records
+            stats = database.get_database_stats()
+            health_status["checks"]["database"] = f"operational ({stats.get('total_records', 0)} records)"
+        else:
+            health_status["checks"]["database"] = "not_configured"
+    except Exception as e:
+        health_status["checks"]["database"] = f"error: {str(e)[:100]}"
+        health_status["status"] = "degraded"
+    
+    return health_status
 
 @app.get("/api/records")
 async def get_records(
