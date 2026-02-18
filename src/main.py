@@ -1,12 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from .extractors import extract_text
 from .validators import validate_json_response
+from . import database
 import google.generativeai as genai
 import json
 import os
 import logging
+import re
 from dotenv import load_dotenv
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -14,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(
+    title="Text-to-Structured-Data API",
+    description="API para extraer datos estructurados de documentos usando IA",
+    version="2.0"
+)
 
 # CORS configuration
 app.add_middleware(
@@ -33,6 +40,28 @@ if not GEMINI_API_KEY:
 
 genai.configure(api_key=GEMINI_API_KEY)
 logger.info("Gemini API configured successfully")
+
+# Initialize database
+database.init_database()
+
+def format_date(date_str: str) -> str:
+    """Convert date from text to DD/MM/YYYY format"""
+    months_es = {
+        'enero': '01', 'febrero': '02', 'marzo': '03', 'abril': '04',
+        'mayo': '05', 'junio': '06', 'julio': '07', 'agosto': '08',
+        'septiembre': '09', 'octubre': '10', 'noviembre': '11', 'diciembre': '12'
+    }
+    
+    # Try to match "16 de febrero de 2026" format
+    pattern = r'(\d+)\s+de\s+(\w+)\s+de\s+(\d{4})'
+    match = re.search(pattern, date_str.lower())
+    if match:
+        day = match.group(1).zfill(2)
+        month = months_es.get(match.group(2), '01')
+        year = match.group(3)
+        return f"{day}/{month}/{year}"
+    
+    return date_str
 
 @app.post("/api/process")
 async def process_file(file: UploadFile = File(...)):
@@ -58,37 +87,159 @@ async def process_file(file: UploadFile = File(...)):
         
         logger.info(f"Extracted {len(raw_text)} characters of text")
         
-        # Process with Gemini
-        prompt = f"""
-        Extrae la siguiente información del texto y devuelve SOLO un JSON válido con estos campos:
-        - cliente: nombre del cliente
-        - monto: cantidad en números
-        - fecha: fecha del documento
-        - tipo_solicitud: tipo de solicitud (Venta, Queja, Factura, etc.)
+        # Step 1: Validate document relevance
+        logger.info("Validating document relevance...")
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        relevance_prompt = f"""
+        Analiza si el siguiente texto contiene información relacionada con solicitudes comerciales, facturas, ventas, quejas o documentos administrativos.
+        
+        El texto debe contener al menos uno de estos elementos:
+        - Nombre de un cliente o empresa
+        - Montos o cantidades monetarias
+        - Fechas de transacciones o emisión
+        - Tipo de solicitud (venta, queja, factura, cotización, etc.)
         
         Texto:
-        {raw_text}
+        {raw_text[:500]}
         
-        Responde SOLO con JSON válido, sin explicaciones adicionales.
+        Responde SOLO con "SI" si el documento es relevante o "NO" si no lo es.
         """
         
-        logger.info("Calling Gemini API...")
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt)
-        logger.info("Gemini API response received")
+        relevance_response = model.generate_content(relevance_prompt)
+        relevance_text = relevance_response.text.strip().upper()
         
-        # Parse and validate JSON
+        if "NO" in relevance_text and "SI" not in relevance_text:
+            logger.warning("Document deemed irrelevant")
+            raise HTTPException(
+                status_code=400, 
+                detail="Este archivo no contiene información de facturas, cotizaciones o solicitudes de compra. Por favor, sube un documento válido relacionado con transacciones comerciales."
+            )
+        
+        # Step 2: Extract structured data with retry mechanism
+        logger.info("Extracting structured data...")
+        max_retries = 3
+        json_response = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"Attempt {attempt}/{max_retries} to extract JSON data")
+                
+                if attempt == 1:
+                    prompt = f"""
+                    Extrae la siguiente información del texto y devuelve SOLO un JSON válido con estos campos:
+                    - cliente: nombre del cliente
+                    - monto: cantidad en números
+                    - fecha: fecha del documento en formato DD/MM/YYYY
+                    - tipo_solicitud: tipo de solicitud (Venta, Queja, Factura, etc.)
+                    
+                    Texto:
+                    {raw_text}
+                    
+                    Responde SOLO con JSON válido, sin explicaciones adicionales.
+                    """
+                else:
+                    # Retry with more explicit instructions
+                    prompt = f"""
+                    IMPORTANTE: Debes responder ÚNICAMENTE con un objeto JSON válido. No incluyas texto adicional, explicaciones ni formato markdown.
+                    
+                    Extrae del siguiente texto estos campos exactos:
+                    {{
+                        "cliente": "nombre del cliente",
+                        "monto": número_sin_símbolos,
+                        "fecha": "DD/MM/YYYY",
+                        "tipo_solicitud": "Venta|Queja|Factura|Cotización|Servicio"
+                    }}
+                    
+                    Texto:
+                    {raw_text}
+                    
+                    Responde SOLO el JSON, nada más.
+                    """
+                
+                response = model.generate_content(prompt)
+                response_text = response.text.strip()
+                logger.info(f"Received response (length: {len(response_text)} chars)")
+                
+                # Try to parse JSON directly
+                try:
+                    json_response = json.loads(response_text)
+                    logger.info("Successfully parsed JSON directly")
+                except json.JSONDecodeError:
+                    logger.info("Direct JSON parse failed, attempting to extract from markdown")
+                    # Try to extract JSON from markdown code blocks
+                    if '```' in response_text:
+                        # Extract content between ``` markers
+                        parts = response_text.split('```')
+                        for part in parts:
+                            part = part.strip()
+                            if part.startswith('json'):
+                                part = part[4:].strip()
+                            if part.startswith('{'):
+                                try:
+                                    json_response = json.loads(part)
+                                    logger.info("Successfully extracted JSON from markdown")
+                                    break
+                                except:
+                                    continue
+                    
+                    # If still no JSON, try to find JSON object in text
+                    if not json_response:
+                        import re
+                        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text)
+                        if json_match:
+                            try:
+                                json_response = json.loads(json_match.group())
+                                logger.info("Successfully extracted JSON using regex")
+                            except:
+                                pass
+                
+                # Validate the JSON response
+                if json_response:
+                    validate_json_response(json_response)
+                    logger.info(f"JSON validation successful on attempt {attempt}")
+                    break
+                else:
+                    raise ValueError("No valid JSON found in response")
+                    
+            except Exception as e:
+                logger.warning(f"Attempt {attempt} failed: {str(e)}")
+                if attempt == max_retries:
+                    logger.error("All retry attempts exhausted")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"La IA no pudo generar una respuesta en formato JSON válido después de {max_retries} intentos. Por favor, intenta con otro documento o contacta a soporte."
+                    )
+                # Wait a bit before retrying
+                import time
+                time.sleep(0.5)
+        
+        if not json_response:
+            raise HTTPException(
+                status_code=500,
+                detail="No se pudo extraer datos estructurados del documento."
+            )
+        
+        # Format date if present
+        if 'fecha' in json_response and json_response['fecha']:
+            json_response['fecha'] = format_date(json_response['fecha'])
+        
+        # Save to database automatically (if configured)
         try:
-            json_response = json.loads(response.text)
-            validate_json_response(json_response)
-        except json.JSONDecodeError:
-            logger.info("Attempting to extract JSON from formatted response")
-            # Try to extract JSON from response
-            json_str = response.text.strip()
-            if json_str.startswith('```'):
-                json_str = json_str.split('```')[1].replace('json', '').strip()
-            json_response = json.loads(json_str)
-            validate_json_response(json_response)
+            db_record = database.save_extracted_data(
+                cliente=json_response.get('cliente', 'Unknown'),
+                monto=float(json_response.get('monto', 0)) if json_response.get('monto') else 0,
+                fecha=json_response.get('fecha'),
+                tipo_solicitud=json_response.get('tipo_solicitud', 'Unknown'),
+                raw_text=raw_text,
+                filename=file.filename
+            )
+            if db_record:
+                logger.info(f"Data saved to database with ID: {db_record['id']}")
+                json_response['db_id'] = db_record['id']
+        except Exception as e:
+            logger.warning(f"Could not save to database: {str(e)}")
+            # Don't fail the request if database save fails
         
         logger.info("File processed successfully")
         return {
@@ -104,4 +255,204 @@ async def process_file(file: UploadFile = File(...)):
 
 @app.get("/")
 async def root():
-    return {"message": "API Text-to-Structured-Data running"}
+    """Root endpoint with API information"""
+    return {
+        "message": "API Text-to-Structured-Data running",
+        "version": "2.0",
+        "endpoints": {
+            "process": "/api/process [POST] - Process document and extract data",
+            "save": "/api/save [POST] - Save edited JSON to database",
+            "history": "/api/history [GET] - Get all saved records",
+            "records": "/api/records [GET] - Get all saved records (with pagination)",
+            "search_client": "/api/records/search?cliente=name [GET] - Search by client",
+            "search_type": "/api/records/search?tipo=type [GET] - Search by type",
+            "stats": "/api/stats [GET] - Get database statistics"
+        },
+        "database_status": "configured" if database.SessionLocal else "not_configured"
+    }
+
+@app.get("/api/records")
+async def get_records(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0)
+):
+    """
+    Get all saved records from database
+    
+    Args:
+        limit: Maximum number of records to return (1-1000)
+        offset: Number of records to skip
+    
+    Returns:
+        List of saved records
+    """
+    if database.SessionLocal is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Base de datos no configurada. Configura DATABASE_URL en las variables de entorno."
+        )
+    
+    records = database.get_all_records(limit=limit, offset=offset)
+    return {
+        "total": len(records),
+        "limit": limit,
+        "offset": offset,
+        "records": records
+    }
+
+@app.get("/api/records/search")
+async def search_records(
+    cliente: Optional[str] = Query(default=None),
+    tipo: Optional[str] = Query(default=None)
+):
+    """
+    Search records by client name or request type
+    
+    Args:
+        cliente: Client name to search for (partial match)
+        tipo: Request type to filter by (partial match)
+    
+    Returns:
+        List of matching records
+    """
+    if database.SessionLocal is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Base de datos no configurada. Configura DATABASE_URL en las variables de entorno."
+        )
+    
+    if not cliente and not tipo:
+        raise HTTPException(
+            status_code=400,
+            detail="Debes proporcionar al menos un parámetro de búsqueda: 'cliente' o 'tipo'"
+        )
+    
+    if cliente:
+        records = database.get_records_by_client(cliente)
+    else:
+        records = database.get_records_by_type(tipo)
+    
+    return {
+        "total": len(records),
+        "search_criteria": {
+            "cliente": cliente,
+            "tipo": tipo
+        },
+        "records": records
+    }
+
+@app.get("/api/stats")
+async def get_stats():
+    """
+    Get database statistics
+    
+    Returns:
+        Statistics about stored data
+    """
+    if database.SessionLocal is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Base de datos no configurada. Configura DATABASE_URL en las variables de entorno."
+        )
+    
+    stats = database.get_database_stats()
+    return stats
+
+@app.post("/api/save")
+async def save_to_database(request_data: dict):
+    """
+    Save manually edited JSON data to database
+    
+    Request body:
+    {
+        "data": {
+            "cliente": "Juan Pérez",
+            "monto": 15000,
+            "fecha": "15/02/2026",
+            "tipo_solicitud": "Factura"
+        }
+    }
+    
+    Returns:
+        Success message with record ID
+    """
+    if database.SessionLocal is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Base de datos no configurada. Configura DATABASE_URL en las variables de entorno."
+        )
+    
+    try:
+        data = request_data.get('data', {})
+        
+        # Validate required fields
+        if not data.get('cliente'):
+            raise HTTPException(
+                status_code=400,
+                detail="El campo 'cliente' es requerido"
+            )
+        
+        if not data.get('tipo_solicitud'):
+            raise HTTPException(
+                status_code=400,
+                detail="El campo 'tipo_solicitud' es requerido"
+            )
+        
+        # Save to database
+        db_record = database.save_extracted_data(
+            cliente=data.get('cliente', 'Unknown'),
+            monto=float(data.get('monto', 0)) if data.get('monto') else 0,
+            fecha=data.get('fecha'),
+            tipo_solicitud=data.get('tipo_solicitud', 'Unknown'),
+            raw_text=None,
+            filename=None
+        )
+        
+        if db_record:
+            logger.info(f"Manually edited data saved to database with ID: {db_record['id']}")
+            return {
+                "success": True,
+                "message": "Registro guardado exitosamente",
+                "id": db_record['id']
+            }
+        else:
+            return {
+                "success": False,
+                "error": "Error al guardar en la base de datos"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving data: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"Error al guardar: {str(e)}"
+        }
+
+@app.get("/api/history")
+async def get_history(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0)
+):
+    """
+    Get all saved records from database (alias for /api/records)
+    Compatible with frontend expectations
+    
+    Args:
+        limit: Maximum number of records to return (1-1000)
+        offset: Number of records to skip
+    
+    Returns:
+        List of saved records in format expected by frontend
+    """
+    if database.SessionLocal is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Base de datos no configurada. Configura DATABASE_URL en las variables de entorno."
+        )
+    
+    records = database.get_all_records(limit=limit, offset=offset)
+    return {
+        "records": records
+    }
