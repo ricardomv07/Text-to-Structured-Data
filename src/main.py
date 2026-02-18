@@ -87,70 +87,19 @@ async def process_file(file: UploadFile = File(...)):
         
         logger.info(f"Extracted {len(raw_text)} characters of text")
         
-        # Step 1: Pre-validation with keywords (fast, reliable check)
-        logger.info("Pre-validating document with keywords...")
-        text_lower = raw_text.lower()
-        
-        # Keywords that should appear in relevant commercial documents
-        business_keywords = [
-            'cliente', 'comprador', 'empresa', 'solicitante', 'proveedor',
-            'factura', 'cotización', 'cotizacion', 'presupuesto', 'pedido',
-            'venta', 'compra', 'solicitud', 'orden', 'contrato',
-            'monto', 'precio', 'total', 'subtotal', 'iva', '$', 'pesos', 'usd',
-            'cantidad', 'importe', 'costo', 'valor'
-        ]
-        
-        # Count how many keywords appear in the document
-        keyword_matches = sum(1 for keyword in business_keywords if keyword in text_lower)
-        
-        # Skip keyword validation if document is very short (< 50 chars might be just a title)
-        if len(raw_text) < 50:
+        # Basic validation: Only reject if document is empty or too short
+        if len(raw_text.strip()) < 20:
             logger.warning(f"Document too short ({len(raw_text)} characters)")
             raise HTTPException(
                 status_code=400,
-                detail="El documento es demasiado corto. Por favor, sube un documento con contenido suficiente."
+                detail="El documento está vacío o es demasiado corto. Por favor, sube un documento con contenido."
             )
         
-        # Only reject if NO keywords found (very likely irrelevant)
-        if keyword_matches == 0:
-            logger.warning(f"Document failed keyword validation (0 matches)")
-            raise HTTPException(
-                status_code=400,
-                detail="Este documento no parece contener información comercial. Por favor, sube una factura, cotización o solicitud de compra."
-            )
+        logger.info("Document validation passed - proceeding to extraction")
         
-        logger.info(f"Keyword validation passed ({keyword_matches} keyword matches)")
-        
-        # Step 2: AI-based validation (more thorough)
-        logger.info("Validating document relevance with AI...")
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        
-        relevance_prompt = f"""
-        Analiza si este documento es un MANUAL, POLÍTICA o PROCEDIMIENTO INTERNO.
-        
-        Responde "NO" SOLO si el documento es claramente un manual técnico, política organizacional, procedimiento interno o lineamiento institucional.
-        
-        Responde "SI" si el documento podría ser una factura, cotización, solicitud, queja o cualquier documento comercial/transaccional.
-        
-        Texto:
-        {raw_text[:800]}
-        
-        Responde ÚNICAMENTE "SI" o "NO".
-        """
-        
-        relevance_response = model.generate_content(relevance_prompt)
-        relevance_text = relevance_response.text.strip().upper()
-        
-        # Only reject if AI is confident it's NOT a commercial document
-        if "NO" in relevance_text and "SI" not in relevance_text:
-            logger.warning(f"AI validation rejected document: {relevance_text}")
-            raise HTTPException(
-                status_code=400,
-                detail="Este documento parece ser un manual o política interna, no una transacción comercial. Por favor, sube una factura, cotización o solicitud de compra."
-            )
-        
-        # Step 2: Extract structured data with retry mechanism
+        # Extract structured data with retry mechanism
         logger.info("Extracting structured data...")
+        model = genai.GenerativeModel('gemini-2.5-flash')
         max_retries = 3
         json_response = None
         
@@ -227,29 +176,11 @@ async def process_file(file: UploadFile = File(...)):
                             except:
                                 pass
                 
-                # Validate the JSON response
+                # Validate the JSON response structure only
                 if json_response:
                     validate_json_response(json_response)
-                    
-                    # Light validation: Only reject CLEARLY fake data
-                    cliente = json_response.get('cliente', '').strip()
-                    
-                    # Only reject if client is completely missing or obviously fake
-                    very_generic = ['unknown', 'no especificado', 'n/a', 'none', 'null', 'xxx']
-                    
-                    if (not cliente or 
-                        len(cliente) < 2 or 
-                        cliente.lower() in very_generic):
-                        logger.warning(f"Suspicious client name: {cliente}")
-                        # Don't reject immediately, let next attempt try
-                        if attempt < max_retries:
-                            raise ValueError(f"Client name too generic on attempt {attempt}, retrying...")
-                        else:
-                            # Last attempt - accept it anyway but log warning
-                            logger.warning("Accepting potentially generic data on final attempt")
-                    
-                    logger.info(f"Data extracted (Cliente: {cliente}, Monto: {json_response.get('monto', 'N/A')})")
                     logger.info(f"JSON validation successful on attempt {attempt}")
+                    logger.info(f"Extracted - Cliente: {json_response.get('cliente', 'N/A')}, Monto: {json_response.get('monto', 'N/A')}")
                     break
                 else:
                     raise ValueError("No valid JSON found in response")
