@@ -110,25 +110,35 @@ async def process_file(file: UploadFile = File(...)):
         commercial_keywords = [
             'factura', 'cotización', 'cotizacion', 'presupuesto', 'pedido',
             'venta', 'compra', 'solicitud', 'orden', 'contrato', 'servicio',
-            'cliente', 'proveedor', 'empresa', 'comprador', 'vendedor',
             'monto', 'precio', 'total', 'subtotal', 'iva', '$', 'pesos', 'usd', 'cantidad'
         ]
         
         # Check for obvious non-commercial document types
-        non_commercial_keywords = ['política', 'politica', 'procedimiento', 'lineamiento', 'manual técnico', 'reglamento']
+        non_commercial_keywords = [
+            'política', 'politica', 'procedimiento', 'lineamiento', 'manual técnico', 'reglamento',
+            'investigación', 'investigacion', 'tesis', 'tesina', 'proyecto de grado',
+            'universidad', 'instituto', 'facultad', 'carrera', 'materia',
+            'abstract', 'resumen', 'introducción teórica', 'marco teórico',
+            'bibliografía', 'referencias', 'anexos', 'objetivos generales',
+            'arquitectura de software', 'patrones de diseño', 'metodología de investigación'
+        ]
+        
+        # Strong commercial indicators (almost always mean it's a real commercial doc)
+        strong_commercial = ['rfc:', 'número de factura:', 'folio:', 'cuenta bancaria:', 'razón social:']
         
         has_commercial = any(keyword in text_lower for keyword in commercial_keywords)
         has_non_commercial = any(keyword in text_lower for keyword in non_commercial_keywords)
+        has_strong_commercial = any(indicator in text_lower for indicator in strong_commercial)
         
-        # Reject only if clearly non-commercial AND no commercial keywords
-        if has_non_commercial and not has_commercial:
-            logger.warning("Document appears to be a policy/manual without commercial content")
+        # Reject if clearly academic/policy AND no strong commercial indicators
+        if has_non_commercial and not has_strong_commercial:
+            logger.warning("Document appears to be academic/policy/manual without strong commercial indicators")
             raise HTTPException(
                 status_code=400,
-                detail="Este documento parece ser un manual o política interna. Por favor, sube una factura, cotización o solicitud de compra."
+                detail="Este documento parece ser académico, manual o política interna. Por favor, sube una factura, cotización o solicitud de compra."
             )
         
-        logger.info(f"Document validation passed (commercial: {has_commercial}, non-commercial: {has_non_commercial})")
+        logger.info(f"Document validation passed (has_commercial: {has_commercial}, has_non_commercial: {has_non_commercial}, has_strong: {has_strong_commercial})")
         
         # Extract structured data with retry mechanism
         logger.info("Extracting structured data...")
@@ -215,10 +225,15 @@ async def process_file(file: UploadFile = File(...)):
                 
                 # Validate the JSON response structure
                 if json_response:
+                    # Validate and normalize (converts null to defaults, maps 'tipo' to 'tipo_solicitud')
                     validate_json_response(json_response)
                     
                     # Additional validation: ensure cliente is not empty
-                    cliente = json_response.get('cliente', '').strip()
+                    cliente = json_response.get('cliente', '')
+                    if isinstance(cliente, str):
+                        cliente = cliente.strip()
+                    else:
+                        cliente = str(cliente) if cliente else ''
                     
                     # If cliente is empty or generic, retry (except on last attempt)
                     if not cliente or cliente.lower() in ['no especificado', 'n/a', 'na', 'unknown']:
@@ -228,6 +243,7 @@ async def process_file(file: UploadFile = File(...)):
                         else:
                             # Last attempt - set default value instead of failing
                             logger.warning(f"Cliente still empty on final attempt, using default")
+                            json_response['cliente'] = "Sin nombre especificado"
                             json_response['cliente'] = "Sin nombre especificado"
                     
                     logger.info(f"JSON validation successful on attempt {attempt}")
