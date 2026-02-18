@@ -142,53 +142,24 @@ async def process_file(file: UploadFile = File(...)):
                 
                 if attempt == 1:
                     prompt = f"""
-                    Analiza este documento y extrae la siguiente información:
+                    Extrae esta información del texto y responde SOLO con JSON:
                     
-                    1. **cliente**: Busca el NOMBRE COMPLETO del cliente, empresa, comprador o solicitante. 
-                       - Puede estar etiquetado como: "Cliente:", "Nombre:", "Empresa:", "Para:", "Solicitante:", "Señor(es):"
-                       - Si no encuentras un nombre específico, pon "No especificado"
-                    
-                    2. **monto**: Total o cantidad en números (sin símbolos $ ni comas)
-                       - Busca palabras como: "Total:", "Monto:", "Importe:", "Precio:", "Valor:"
-                       - Si hay IVA, usa el total final
-                       - Si no hay monto, pon 0
-                    
-                    3. **fecha**: Fecha del documento en formato DD/MM/YYYY
-                       - Busca etiquetas como: "Fecha:", "Emisión:", "Date:"
-                       - Si no encuentras fecha, pon la fecha de hoy
-                    
-                    4. **tipo_solicitud**: Tipo de documento
-                       - Opciones: "Factura", "Cotización", "Orden de compra", "Solicitud", "Queja", "Servicio"
-                       - Elige el que mejor describa el documento
-                    
-                    Texto del documento:
-                    {raw_text}
-                    
-                    Responde SOLO con un JSON válido en este formato exacto:
-                    {{"cliente": "nombre", "monto": 1234.56, "fecha": "18/02/2026", "tipo_solicitud": "Factura"}}
-                    """
-                else:
-                    # Retry with more explicit instructions
-                    prompt = f"""
-                    CRÍTICO: Responde ÚNICAMENTE con JSON válido. Sin texto extra, sin markdown, sin explicaciones.
-                    
-                    Busca en el texto:
-                    1. CLIENTE: Nombre de persona o empresa (NO pongas "cliente", "empresa" genérico - busca un NOMBRE ESPECÍFICO)
-                    2. MONTO: Número del total/precio (sin $ ni comas)
-                    3. FECHA: En formato DD/MM/YYYY
-                    4. TIPO: Factura, Cotización, Orden de compra, Solicitud, Queja, o Servicio
-                    
-                    Si no encuentras alguno:
-                    - cliente: "No especificado"
-                    - monto: 0
-                    - fecha: "18/02/2026"
-                    - tipo_solicitud: "Documento"
+                    {{"cliente": "nombre del cliente o empresa", "monto": 1234, "fecha": "DD/MM/YYYY", "tipo_solicitud": "Factura"}}
                     
                     Texto:
-                    {raw_text[:1500]}
+                    {raw_text[:2000]}
                     
-                    Formato requerido:
-                    {{"cliente": "nombre específico", "monto": 0, "fecha": "DD/MM/YYYY", "tipo_solicitud": "tipo"}}
+                    Responde SOLO el JSON, sin explicaciones.
+                    """
+                else:
+                    # Retry with even simpler prompt
+                    prompt = f"""
+                    Del siguiente texto extrae cliente, monto, fecha y tipo.
+                    Responde en formato JSON sin texto adicional.
+                    
+                    Texto: {raw_text[:1000]}
+                    
+                    JSON:
                     """
                 
                 # Call Gemini API with error handling
@@ -196,6 +167,8 @@ async def process_file(file: UploadFile = File(...)):
                     response = model.generate_content(prompt)
                     response_text = response.text.strip()
                     logger.info(f"Received response (length: {len(response_text)} chars)")
+                    # Log preview of response for debugging
+                    logger.info(f"Response preview: {response_text[:300]}")
                 except Exception as gemini_error:
                     logger.error(f"Gemini API error on attempt {attempt}: {str(gemini_error)}")
                     # Check if it's a rate limit or quota error
@@ -261,6 +234,10 @@ async def process_file(file: UploadFile = File(...)):
                     logger.info(f"Extracted - Cliente: {json_response.get('cliente', 'N/A')}, Monto: {json_response.get('monto', 'N/A')}")
                     break
                 else:
+                    # Last resort: if still no JSON and it's the final attempt, log the full response
+                    if attempt == max_retries:
+                        logger.error("All parsing methods failed. Full response:")
+                        logger.error(response_text)
                     raise ValueError("No valid JSON found in response")
                     
             except Exception as e:
