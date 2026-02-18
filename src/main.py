@@ -87,33 +87,58 @@ async def process_file(file: UploadFile = File(...)):
         
         logger.info(f"Extracted {len(raw_text)} characters of text")
         
-        # Step 1: Validate document relevance
-        logger.info("Validating document relevance...")
+        # Step 1: Pre-validation with keywords (fast, reliable check)
+        logger.info("Pre-validating document with keywords...")
+        text_lower = raw_text.lower()
+        
+        # Keywords that should appear in relevant commercial documents
+        business_keywords = [
+            'cliente', 'comprador', 'empresa', 'solicitante', 'proveedor',
+            'factura', 'cotización', 'cotizacion', 'presupuesto', 'pedido',
+            'venta', 'compra', 'solicitud', 'orden', 'contrato',
+            'monto', 'precio', 'total', 'subtotal', 'iva', '$', 'pesos', 'usd',
+            'cantidad', 'importe', 'costo', 'valor'
+        ]
+        
+        # Count how many keywords appear in the document
+        keyword_matches = sum(1 for keyword in business_keywords if keyword in text_lower)
+        
+        if keyword_matches < 2:
+            logger.warning(f"Document failed keyword validation (only {keyword_matches} matches)")
+            raise HTTPException(
+                status_code=400,
+                detail="Este documento no parece contener información comercial relevante (facturas, cotizaciones, solicitudes de compra). Por favor, sube un documento válido."
+            )
+        
+        logger.info(f"Keyword validation passed ({keyword_matches} matches)")
+        
+        # Step 2: AI-based validation (more thorough)
+        logger.info("Validating document relevance with AI...")
         model = genai.GenerativeModel('gemini-2.5-flash')
         
         relevance_prompt = f"""
-        Analiza si el siguiente texto contiene información relacionada con solicitudes comerciales, facturas, ventas, quejas o documentos administrativos.
+        Analiza si este documento es una FACTURA, COTIZACIÓN, SOLICITUD DE COMPRA o documento comercial similar.
         
-        El texto debe contener al menos uno de estos elementos:
-        - Nombre de un cliente o empresa
-        - Montos o cantidades monetarias
-        - Fechas de transacciones o emisión
-        - Tipo de solicitud (venta, queja, factura, cotización, etc.)
+        Debe contener:
+        - Nombre ESPECÍFICO de un cliente/empresa (no genérico)
+        - Monto o precio ESPECÍFICO con números
+        - Información de transacción comercial
         
         Texto:
-        {raw_text[:500]}
+        {raw_text[:800]}
         
-        Responde SOLO con "SI" si el documento es relevante o "NO" si no lo es.
+        Responde ÚNICAMENTE "SI" si es un documento comercial válido con datos específicos de transacción.
+        Responde "NO" si es un manual, política, procedimiento, lineamiento u otro documento no comercial.
         """
         
         relevance_response = model.generate_content(relevance_prompt)
         relevance_text = relevance_response.text.strip().upper()
         
-        if "NO" in relevance_text and "SI" not in relevance_text:
-            logger.warning("Document deemed irrelevant")
+        if "NO" in relevance_text or "SI" not in relevance_text:
+            logger.warning(f"AI validation failed: {relevance_text}")
             raise HTTPException(
-                status_code=400, 
-                detail="Este archivo no contiene información de facturas, cotizaciones o solicitudes de compra. Por favor, sube un documento válido relacionado con transacciones comerciales."
+                status_code=400,
+                detail="Este archivo no contiene información de transacciones comerciales. Por favor, sube una factura, cotización o solicitud de compra válida."
             )
         
         # Step 2: Extract structured data with retry mechanism
@@ -197,6 +222,38 @@ async def process_file(file: UploadFile = File(...)):
                 # Validate the JSON response
                 if json_response:
                     validate_json_response(json_response)
+                    
+                    # Additional validation: Check for generic/invented data
+                    cliente = json_response.get('cliente', '').strip()
+                    monto = json_response.get('monto', 0)
+                    
+                    # List of generic/placeholder values that indicate no real data
+                    generic_values = [
+                        'unknown', 'no especificado', 'n/a', 'na', 'none', 'null',
+                        'cliente', 'empresa', 'comprador', 'solicitante', 'proveedor',
+                        'no disponible', 'sin información', 'no indicado', 'vacío',
+                        'test', 'ejemplo', 'demo', 'muestra'
+                    ]
+                    
+                    # Check if client name is generic or too short
+                    if (not cliente or 
+                        len(cliente) < 3 or 
+                        cliente.lower() in generic_values or
+                        any(generic in cliente.lower() for generic in ['xxx', '???', 'pendiente'])):
+                        logger.warning(f"Generic client name detected: {cliente}")
+                        raise ValueError("No se encontró un nombre de cliente válido en el documento")
+                    
+                    # Check if amount is missing or zero
+                    try:
+                        monto_float = float(monto) if monto else 0
+                        if monto_float <= 0:
+                            logger.warning(f"Invalid amount detected: {monto}")
+                            raise ValueError("No se encontró un monto válido en el documento")
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid amount format: {monto}")
+                        raise ValueError("No se encontró un monto válido en el documento")
+                    
+                    logger.info(f"Data validation successful (Cliente: {cliente}, Monto: {monto})")
                     logger.info(f"JSON validation successful on attempt {attempt}")
                     break
                 else:
@@ -225,6 +282,7 @@ async def process_file(file: UploadFile = File(...)):
             json_response['fecha'] = format_date(json_response['fecha'])
         
         # Save to database automatically (if configured)
+        # Note: db_id is not exposed in the response, only logged
         try:
             db_record = database.save_extracted_data(
                 cliente=json_response.get('cliente', 'Unknown'),
@@ -236,7 +294,6 @@ async def process_file(file: UploadFile = File(...)):
             )
             if db_record:
                 logger.info(f"Data saved to database with ID: {db_record['id']}")
-                json_response['db_id'] = db_record['id']
         except Exception as e:
             logger.warning(f"Could not save to database: {str(e)}")
             # Don't fail the request if database save fails
