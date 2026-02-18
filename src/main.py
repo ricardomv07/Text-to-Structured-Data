@@ -8,6 +8,7 @@ import json
 import os
 import logging
 import re
+import time
 from dotenv import load_dotenv
 from typing import Optional
 
@@ -135,34 +136,53 @@ async def process_file(file: UploadFile = File(...)):
                 
                 if attempt == 1:
                     prompt = f"""
-                    Extrae la siguiente información del texto y devuelve SOLO un JSON válido con estos campos:
-                    - cliente: nombre del cliente
-                    - monto: cantidad en números
-                    - fecha: fecha del documento en formato DD/MM/YYYY
-                    - tipo_solicitud: tipo de solicitud (Venta, Queja, Factura, etc.)
+                    Analiza este documento y extrae la siguiente información:
                     
-                    Texto:
+                    1. **cliente**: Busca el NOMBRE COMPLETO del cliente, empresa, comprador o solicitante. 
+                       - Puede estar etiquetado como: "Cliente:", "Nombre:", "Empresa:", "Para:", "Solicitante:", "Señor(es):"
+                       - Si no encuentras un nombre específico, pon "No especificado"
+                    
+                    2. **monto**: Total o cantidad en números (sin símbolos $ ni comas)
+                       - Busca palabras como: "Total:", "Monto:", "Importe:", "Precio:", "Valor:"
+                       - Si hay IVA, usa el total final
+                       - Si no hay monto, pon 0
+                    
+                    3. **fecha**: Fecha del documento en formato DD/MM/YYYY
+                       - Busca etiquetas como: "Fecha:", "Emisión:", "Date:"
+                       - Si no encuentras fecha, pon la fecha de hoy
+                    
+                    4. **tipo_solicitud**: Tipo de documento
+                       - Opciones: "Factura", "Cotización", "Orden de compra", "Solicitud", "Queja", "Servicio"
+                       - Elige el que mejor describa el documento
+                    
+                    Texto del documento:
                     {raw_text}
                     
-                    Responde SOLO con JSON válido, sin explicaciones adicionales.
+                    Responde SOLO con un JSON válido en este formato exacto:
+                    {{"cliente": "nombre", "monto": 1234.56, "fecha": "18/02/2026", "tipo_solicitud": "Factura"}}
                     """
                 else:
                     # Retry with more explicit instructions
                     prompt = f"""
-                    IMPORTANTE: Debes responder ÚNICAMENTE con un objeto JSON válido. No incluyas texto adicional, explicaciones ni formato markdown.
+                    CRÍTICO: Responde ÚNICAMENTE con JSON válido. Sin texto extra, sin markdown, sin explicaciones.
                     
-                    Extrae del siguiente texto estos campos exactos:
-                    {{
-                        "cliente": "nombre del cliente",
-                        "monto": número_sin_símbolos,
-                        "fecha": "DD/MM/YYYY",
-                        "tipo_solicitud": "Venta|Queja|Factura|Cotización|Servicio"
-                    }}
+                    Busca en el texto:
+                    1. CLIENTE: Nombre de persona o empresa (NO pongas "cliente", "empresa" genérico - busca un NOMBRE ESPECÍFICO)
+                    2. MONTO: Número del total/precio (sin $ ni comas)
+                    3. FECHA: En formato DD/MM/YYYY
+                    4. TIPO: Factura, Cotización, Orden de compra, Solicitud, Queja, o Servicio
+                    
+                    Si no encuentras alguno:
+                    - cliente: "No especificado"
+                    - monto: 0
+                    - fecha: "18/02/2026"
+                    - tipo_solicitud: "Documento"
                     
                     Texto:
-                    {raw_text}
+                    {raw_text[:1500]}
                     
-                    Responde SOLO el JSON, nada más.
+                    Formato requerido:
+                    {{"cliente": "nombre específico", "monto": 0, "fecha": "DD/MM/YYYY", "tipo_solicitud": "tipo"}}
                     """
                 
                 response = model.generate_content(prompt)
@@ -202,9 +222,23 @@ async def process_file(file: UploadFile = File(...)):
                             except:
                                 pass
                 
-                # Validate the JSON response structure only
+                # Validate the JSON response structure
                 if json_response:
                     validate_json_response(json_response)
+                    
+                    # Additional validation: ensure cliente is not empty
+                    cliente = json_response.get('cliente', '').strip()
+                    
+                    # If cliente is empty or generic, retry (except on last attempt)
+                    if not cliente or cliente.lower() in ['no especificado', 'n/a', 'na', 'unknown']:
+                        if attempt < max_retries:
+                            logger.warning(f"Cliente empty or generic on attempt {attempt}: '{cliente}' - retrying...")
+                            raise ValueError(f"Cliente field is empty, retrying (attempt {attempt})")
+                        else:
+                            # Last attempt - set default value instead of failing
+                            logger.warning(f"Cliente still empty on final attempt, using default")
+                            json_response['cliente'] = "Sin nombre especificado"
+                    
                     logger.info(f"JSON validation successful on attempt {attempt}")
                     logger.info(f"Extracted - Cliente: {json_response.get('cliente', 'N/A')}, Monto: {json_response.get('monto', 'N/A')}")
                     break
@@ -220,7 +254,6 @@ async def process_file(file: UploadFile = File(...)):
                         detail=f"La IA no pudo generar una respuesta en formato JSON válido después de {max_retries} intentos. Por favor, intenta con otro documento o contacta a soporte."
                     )
                 # Wait a bit before retrying
-                import time
                 time.sleep(0.5)
         
         if not json_response:
